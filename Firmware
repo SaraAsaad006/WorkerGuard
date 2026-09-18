@@ -1,230 +1,730 @@
+```cpp
 #include <SPI.h>
 #include <LoRa.h>
 #include <Wire.h>
 #include <MPU6050.h>
 #include <DHT.h>
+#include <math.h>
 
-// ==========================================
-// 1. PIN DEFINITIONS & CONSTANTS
-// ==========================================
-#define LORA_SS 5
-#define LORA_RST 14
-#define LORA_DIO0 2
-#define LORA_FREQ 433E6 // Change to 868E6 or 915E6 based on your region
+// ============================================================
+// WORKERGUARD
+// Real-Time Industrial Worker Safety & Emergency Response
+//
+// Core flow:
+// DETECT -> CONFIRM -> ESCALATE -> MONITOR
+// ============================================================
 
+
+// ============================================================
+// 1. PIN DEFINITIONS
+// ============================================================
+
+// ---------- LoRa ----------
+#define LORA_SCK   18
+#define LORA_MISO  19
+#define LORA_MOSI  23
+#define LORA_SS     5
+#define LORA_RST   14
+#define LORA_DIO0   2
+
+#define LORA_FREQ 433E6
+
+
+// ---------- MPU6050 ----------
 #define MPU_SDA 21
 #define MPU_SCL 22
 
-#define DHT_PIN 4
+
+// ---------- DHT22 ----------
+#define DHT_PIN  4
 #define DHT_TYPE DHT22
 
+
+// ---------- User Interface ----------
 #define BUZZER_PIN 15
 #define BUTTON_PIN 13
 
-// Worker Identity (Change this for each wearable)
+
+// ============================================================
+// 2. WORKER CONFIGURATION
+// ============================================================
+
 const String WORKER_ID = "W-001";
 
-// Timing Constants (in milliseconds)
-const unsigned long INACTIVITY_TIMEOUT = 120000; // 2 minutes of no movement
-const unsigned long CONFIRMATION_WINDOW = 30000;  // 30 seconds to press button after alert
-const unsigned long REPETITIVE_ALERT_INTERVAL = 3600000; // 1 hour
+// Simulated work zone for the PoC.
+// In the production version this would come from
+// GPS / indoor positioning / site infrastructure.
+const String WORKER_ZONE = "ZONE-B";
 
-// ==========================================
-// 2. OBJECT INITIALIZATION
-// ==========================================
+
+// ============================================================
+// 3. TIMING CONSTANTS
+// ============================================================
+
+// For the hackathon demo, keep these short.
+//
+// Production values would be calibrated through
+// field testing and safety validation.
+
+const unsigned long INACTIVITY_TIMEOUT = 120000;  // 2 min
+const unsigned long CONFIRMATION_WINDOW = 30000;  // 30 sec
+
+// Environmental readings
+const unsigned long SENSOR_READ_INTERVAL = 2000;
+
+// Repetitive/ergonomic reminder
+const unsigned long STRETCH_INTERVAL = 3600000;   // 1 hour
+
+
+// ============================================================
+// 4. DETECTION THRESHOLDS
+// ============================================================
+
+// NOTE:
+// These are PoC thresholds only.
+// They are NOT validated medical/safety thresholds.
+
+// Suspected fall threshold.
+// MPU6050 raw values are converted to acceleration magnitude.
+const float FALL_ACCEL_THRESHOLD = 2.5;
+
+// Environmental heat-risk threshold.
+// DHT22 provides environmental temperature/humidity;
+// this does NOT diagnose heat illness.
+const float HEAT_TEMP_THRESHOLD = 35.0;
+const float HEAT_HUMIDITY_THRESHOLD = 60.0;
+
+
+// ============================================================
+// 5. OBJECTS
+// ============================================================
+
 MPU6050 mpu;
 DHT dht(DHT_PIN, DHT_TYPE);
 
-// System States
-enum WorkerState {
+
+// ============================================================
+// 6. STATE MACHINE
+// ============================================================
+
+enum WorkerState
+{
   STATE_NORMAL,
-  STATE_INACTIVITY_ALERT,
+
+  // Automatic event detected.
+  // Worker must confirm they are okay.
   STATE_FALL_ALERT,
-  STATE_SOS_ALERT
+  STATE_INACTIVITY_ALERT,
+  STATE_HEAT_ALERT,
+
+  // Worker manually pressed SOS.
+  // This skips the confirmation stage.
+  STATE_SOS_ALERT,
+
+  // Automatic event received no response.
+  STATE_ESCALATED
 };
 
 WorkerState currentState = STATE_NORMAL;
+
+
+// ============================================================
+// 7. GLOBAL VARIABLES
+// ============================================================
+
 unsigned long lastMovementTime = 0;
 unsigned long alertStartTime = 0;
-unsigned long lastRepetitiveAlert = 0;
+unsigned long lastSensorRead = 0;
+unsigned long lastStretchReminder = 0;
 
-// Sensor Data Variables
 float currentTemp = 0.0;
 float currentHumidity = 0.0;
-bool fallDetected = false;
+float currentAccelMagnitude = 1.0;
 
-// ==========================================
-// 3. SETUP
-// ==========================================
-void setup() {
+String currentAlertReason = "";
+
+
+// ============================================================
+// 8. SETUP
+// ============================================================
+
+void setup()
+{
   Serial.begin(115200);
-  while (!Serial);
 
   pinMode(BUZZER_PIN, OUTPUT);
   pinMode(BUTTON_PIN, INPUT_PULLUP);
 
-  // Initialize DHT22
+  noTone(BUZZER_PIN);
+
+  // ----------------------------------------------------------
+  // DHT22
+  // ----------------------------------------------------------
+
   dht.begin();
 
-  // Initialize MPU6050
+
+  // ----------------------------------------------------------
+  // MPU6050
+  // ----------------------------------------------------------
+
   Wire.begin(MPU_SDA, MPU_SCL);
+
   mpu.initialize();
-  if (!mpu.testConnection()) {
-    Serial.println("MPU6050 connection failed!");
+
+  if (!mpu.testConnection())
+  {
+    Serial.println("ERROR|MPU6050|Connection failed");
+  }
+  else
+  {
+    Serial.println("SYSTEM|MPU6050|Connected");
   }
 
-  // Initialize LoRa
+
+  // ----------------------------------------------------------
+  // LoRa
+  // ----------------------------------------------------------
+
+  SPI.begin(LORA_SCK, LORA_MISO, LORA_MOSI, LORA_SS);
+
   LoRa.setPins(LORA_SS, LORA_RST, LORA_DIO0);
-  if (!LoRa.begin(LORA_FREQ)) {
-    Serial.println("LoRa init failed. Check wiring.");
-    while (1);
+
+  if (!LoRa.begin(LORA_FREQ))
+  {
+    Serial.println("ERROR|LORA|Initialization failed");
+
+    // For PoC debugging, continue running even if
+    // LoRa is unavailable.
   }
-  Serial.println("LoRa Initialized OK!");
+  else
+  {
+    Serial.println("SYSTEM|LORA|Connected");
+  }
+
+
+  // ----------------------------------------------------------
+  // Initial state
+  // ----------------------------------------------------------
 
   lastMovementTime = millis();
-  Serial.println("Wearable Firmware Started. Worker ID: " + WORKER_ID);
+  lastStretchReminder = millis();
+
+  Serial.println();
+  Serial.println("====================================");
+  Serial.println("      WORKERGUARD STARTED");
+  Serial.println("====================================");
+
+  Serial.println("WORKER|" + WORKER_ID);
+  Serial.println("ZONE|" + WORKER_ZONE);
+  Serial.println("STATE|NORMAL");
 }
 
-// ==========================================
-// 4. MAIN LOOP
-// ==========================================
-void loop() {
+
+// ============================================================
+// 9. MAIN LOOP
+// ============================================================
+
+void loop()
+{
   readSensors();
+
+  detectEvents();
+
   handleStateMachine();
+
   checkButton();
-  delay(100); // Small delay to prevent CPU hogging
+
+  delay(50);
 }
 
-// ==========================================
-// 5. SENSOR READING FUNCTIONS
-// ==========================================
-void readSensors() {
-  // --- Read DHT22 ---
-  float t = dht.readTemperature();
-  float h = dht.readHumidity();
-  if (!isnan(t) && !isnan(h)) {
-    currentTemp = t;
-    currentHumidity = h;
+
+// ============================================================
+// 10. SENSOR READING
+// ============================================================
+
+void readSensors()
+{
+  unsigned long now = millis();
+
+  // Avoid reading DHT22 too frequently.
+  if (now - lastSensorRead < SENSOR_READ_INTERVAL)
+  {
+    return;
   }
 
-  // --- Read MPU6050 ---
-  int16_t ax, ay, az, gx, gy, gz;
-  mpu.getMotion6(&ax, &ay, &az, &gx, &gy, &gz);
+  lastSensorRead = now;
 
-  // Calculate total acceleration (in g's)
-  float accelMagnitude = sqrt(sq(ax) + sq(ay) + sq(az)) / 16384.0;
 
-  // --- Fall Detection Algorithm ---
-  // A fall is typically characterized by a sudden spike in acceleration (> 2.5g)
-  if (accelMagnitude > 2.5 && currentState == STATE_NORMAL) {
-    triggerAlert(STATE_FALL_ALERT, "Fall Detected");
+  // ----------------------------------------------------------
+  // DHT22
+  // ----------------------------------------------------------
+
+  float temperature = dht.readTemperature();
+  float humidity = dht.readHumidity();
+
+  if (!isnan(temperature) && !isnan(humidity))
+  {
+    currentTemp = temperature;
+    currentHumidity = humidity;
   }
 
-  // --- Inactivity Detection ---
-  // Check if there is significant movement. Thresholds depend on sensor placement.
-  if (abs(ax) > 3000 || abs(ay) > 3000 || abs(az) > 3000 || abs(gx) > 5000 || abs(gy) > 5000 || abs(gz) > 5000) {
-    lastMovementTime = millis(); // Reset inactivity timer on movement
-  }
 
-  // --- Repetitive Movement Detection (Simplified) ---
-  // In a real scenario, you'd track specific joint angles over time.
-  // Here we simulate it with a time-based reminder if the worker is active.
-  if (millis() - lastRepetitiveAlert > REPETITIVE_ALERT_INTERVAL && currentState == STATE_NORMAL) {
-    beepBuzzer(2, 200); // Short double beep
-    sendLoRaPacket("Ergonomic Alert: Time for a stretch break.");
-    lastRepetitiveAlert = millis();
+  // ----------------------------------------------------------
+  // MPU6050
+  // ----------------------------------------------------------
+
+  int16_t ax;
+  int16_t ay;
+  int16_t az;
+
+  int16_t gx;
+  int16_t gy;
+  int16_t gz;
+
+  mpu.getMotion6(
+    &ax,
+    &ay,
+    &az,
+    &gx,
+    &gy,
+    &gz
+  );
+
+
+  // Convert acceleration to g.
+  //
+  // For the default MPU6050 ±2g configuration,
+  // 16384 raw units ≈ 1g.
+
+  float accelMagnitude =
+    sqrt(
+      (float)ax * ax +
+      (float)ay * ay +
+      (float)az * az
+    ) / 16384.0;
+
+  currentAccelMagnitude = accelMagnitude;
+
+
+  // ----------------------------------------------------------
+  // Movement detection
+  // ----------------------------------------------------------
+
+  bool movementDetected =
+    abs(ax) > 3000 ||
+    abs(ay) > 3000 ||
+    abs(az) > 3000 ||
+    abs(gx) > 5000 ||
+    abs(gy) > 5000 ||
+    abs(gz) > 5000;
+
+  if (movementDetected)
+  {
+    lastMovementTime = now;
   }
 }
 
-// ==========================================
-// 6. STATE MACHINE
-// ==========================================
-void handleStateMachine() {
-  switch (currentState) {
+
+// ============================================================
+// 11. EVENT DETECTION
+// ============================================================
+
+void detectEvents()
+{
+  // Never trigger a new automatic event while
+  // another event is already being handled.
+
+  if (currentState != STATE_NORMAL)
+  {
+    return;
+  }
+
+
+  // ----------------------------------------------------------
+  // FALL / IMPACT
+  // ----------------------------------------------------------
+
+  if (currentAccelMagnitude > FALL_ACCEL_THRESHOLD)
+  {
+    triggerAutomaticAlert(
+      STATE_FALL_ALERT,
+      "SUSPECTED_FALL"
+    );
+
+    return;
+  }
+
+
+  // ----------------------------------------------------------
+  // ENVIRONMENTAL HEAT RISK
+  // ----------------------------------------------------------
+
+  if (
+    currentTemp >= HEAT_TEMP_THRESHOLD &&
+    currentHumidity >= HEAT_HUMIDITY_THRESHOLD
+  )
+  {
+    triggerAutomaticAlert(
+      STATE_HEAT_ALERT,
+      "ENVIRONMENTAL_HEAT_RISK"
+    );
+
+    return;
+  }
+
+
+  // ----------------------------------------------------------
+  // PROLONGED INACTIVITY
+  // ----------------------------------------------------------
+
+  if (millis() - lastMovementTime > INACTIVITY_TIMEOUT)
+  {
+    triggerAutomaticAlert(
+      STATE_INACTIVITY_ALERT,
+      "PROLONGED_INACTIVITY"
+    );
+
+    return;
+  }
+
+
+  // ----------------------------------------------------------
+  // ERGONOMIC REMINDER
+  // ----------------------------------------------------------
+
+  if (millis() - lastStretchReminder > STRETCH_INTERVAL)
+  {
+    sendLoRaPacket(
+      "INFO|" +
+      WORKER_ID +
+      "|" +
+      WORKER_ZONE +
+      "|ERGONOMIC_REMINDER"
+    );
+
+    beepBuzzer(2, 150);
+
+    lastStretchReminder = millis();
+  }
+}
+
+
+// ============================================================
+// 12. STATE MACHINE
+// ============================================================
+
+void handleStateMachine()
+{
+  unsigned long now = millis();
+
+
+  switch (currentState)
+  {
+
+    // --------------------------------------------------------
+    // NORMAL
+    // --------------------------------------------------------
+
     case STATE_NORMAL:
-      // Check for prolonged inactivity
-      if (millis() - lastMovementTime > INACTIVITY_TIMEOUT) {
-        triggerAlert(STATE_INACTIVITY_ALERT, "Inactivity Detected");
-      }
+
+      // Nothing to do.
+      // Sensors continue being monitored.
+
       break;
 
-    case STATE_INACTIVITY_ALERT:
+
+    // --------------------------------------------------------
+    // AUTOMATIC ALERT
+    // --------------------------------------------------------
+
     case STATE_FALL_ALERT:
-      // We are in an alert state. Wait for button press.
-      if (millis() - alertStartTime > CONFIRMATION_WINDOW) {
-        // Worker failed to respond. Send SOS to dashboard.
-        currentState = STATE_SOS_ALERT;
-        String msg = "CRITICAL: Worker " + WORKER_ID + " unresponsive. Last state: " + 
-                     (currentState == STATE_FALL_ALERT ? "Fall" : "Inactivity");
-        sendLoRaPacket(msg);
-        beepBuzzer(5, 100); // Continuous alarm
+    case STATE_INACTIVITY_ALERT:
+    case STATE_HEAT_ALERT:
+
+      // Worker has a limited window to confirm
+      // that they are okay.
+
+      if (now - alertStartTime >= CONFIRMATION_WINDOW)
+      {
+        escalateAlert();
       }
+
       break;
+
+
+    // --------------------------------------------------------
+    // MANUAL SOS
+    // --------------------------------------------------------
 
     case STATE_SOS_ALERT:
-      // Keep sending SOS until reset (or handle via dashboard)
-      // In a real system, you might reset this after a timeout.
+
+      // Manual SOS is already an explicit worker request.
+      // No confirmation window is required.
+
+      break;
+
+
+    // --------------------------------------------------------
+    // ESCALATED
+    // --------------------------------------------------------
+
+    case STATE_ESCALATED:
+
+      // In the PoC we remain here until reset/handled.
+      //
+      // A production implementation could:
+      // - retry transmission
+      // - receive supervisor acknowledgement
+      // - activate additional communication channels
+      // - record the event in cloud storage
+
       break;
   }
 }
 
-// ==========================================
-// 7. BUTTON HANDLING
-// ==========================================
-void checkButton() {
-  // Button is active LOW (pressed = LOW)
-  if (digitalRead(BUTTON_PIN) == LOW) {
-    delay(50); // Debounce
-    if (digitalRead(BUTTON_PIN) == LOW) {
-      
-      if (currentState == STATE_NORMAL) {
-        // Manual SOS Triggered
-        triggerAlert(STATE_SOS_ALERT, "Manual SOS Triggered");
-        sendLoRaPacket("SOS: Worker " + WORKER_ID + " pressed the panic button!");
-        
-      } else if (currentState == STATE_INACTIVITY_ALERT || currentState == STATE_FALL_ALERT) {
-        // Worker confirmed they are OK
-        currentState = STATE_NORMAL;
-        lastMovementTime = millis(); // Reset timer
-        noTone(BUZZER_PIN);
-        sendLoRaPacket("OK: Worker " + WORKER_ID + " confirmed they are safe.");
-      }
-      
-      // Wait for button release to avoid multiple triggers
-      while(digitalRead(BUTTON_PIN) == LOW) { delay(10); }
-    }
+
+// ============================================================
+// 13. AUTOMATIC ALERT TRIGGER
+// ============================================================
+
+void triggerAutomaticAlert(
+  WorkerState newState,
+  String reason
+)
+{
+  currentState = newState;
+
+  currentAlertReason = reason;
+
+  alertStartTime = millis();
+
+
+  // ----------------------------------------------------------
+  // Local worker notification
+  // ----------------------------------------------------------
+
+  beepBuzzer(3, 250);
+
+
+  // ----------------------------------------------------------
+  // Serial event
+  // ----------------------------------------------------------
+
+  Serial.println(
+    "EVENT|" +
+    WORKER_ID +
+    "|" +
+    WORKER_ZONE +
+    "|" +
+    reason +
+    "|AWAITING_CONFIRMATION"
+  );
+
+
+  // ----------------------------------------------------------
+  // LoRa event
+  // ----------------------------------------------------------
+
+  sendLoRaPacket(
+    "EVENT|" +
+    WORKER_ID +
+    "|" +
+    WORKER_ZONE +
+    "|" +
+    reason +
+    "|AWAITING_CONFIRMATION"
+  );
+}
+
+
+// ============================================================
+// 14. ESCALATION
+// ============================================================
+
+void escalateAlert()
+{
+  currentState = STATE_ESCALATED;
+
+
+  String message =
+    "CRITICAL|" +
+    WORKER_ID +
+    "|" +
+    WORKER_ZONE +
+    "|" +
+    currentAlertReason +
+    "|NO_RESPONSE";
+
+
+  // ----------------------------------------------------------
+  // Local notification
+  // ----------------------------------------------------------
+
+  Serial.println(message);
+
+
+  // ----------------------------------------------------------
+  // Send to supervisor / gateway
+  // ----------------------------------------------------------
+
+  sendLoRaPacket(message);
+
+
+  // ----------------------------------------------------------
+  // Local alarm
+  // ----------------------------------------------------------
+
+  beepBuzzer(5, 150);
+}
+
+
+// ============================================================
+// 15. BUTTON HANDLING
+// ============================================================
+
+void checkButton()
+{
+  if (digitalRead(BUTTON_PIN) != LOW)
+  {
+    return;
+  }
+
+
+  // Simple debounce
+  delay(50);
+
+
+  if (digitalRead(BUTTON_PIN) != LOW)
+  {
+    return;
+  }
+
+
+  // ----------------------------------------------------------
+  // NORMAL -> MANUAL SOS
+  // ----------------------------------------------------------
+
+  if (currentState == STATE_NORMAL)
+  {
+    currentState = STATE_SOS_ALERT;
+
+    currentAlertReason = "MANUAL_SOS";
+
+    Serial.println(
+      "CRITICAL|" +
+      WORKER_ID +
+      "|" +
+      WORKER_ZONE +
+      "|MANUAL_SOS|WORKER_TRIGGERED"
+    );
+
+    sendLoRaPacket(
+      "CRITICAL|" +
+      WORKER_ID +
+      "|" +
+      WORKER_ZONE +
+      "|MANUAL_SOS|WORKER_TRIGGERED"
+    );
+
+    beepBuzzer(5, 150);
+  }
+
+
+  // ----------------------------------------------------------
+  // AUTOMATIC ALERT -> WORKER CONFIRMS OK
+  // ----------------------------------------------------------
+
+  else if (
+    currentState == STATE_FALL_ALERT ||
+    currentState == STATE_INACTIVITY_ALERT ||
+    currentState == STATE_HEAT_ALERT
+  )
+  {
+    Serial.println(
+      "CLEARED|" +
+      WORKER_ID +
+      "|" +
+      WORKER_ZONE +
+      "|" +
+      currentAlertReason +
+      "|WORKER_CONFIRMED_OK"
+    );
+
+    sendLoRaPacket(
+      "CLEARED|" +
+      WORKER_ID +
+      "|" +
+      WORKER_ZONE +
+      "|" +
+      currentAlertReason +
+      "|WORKER_CONFIRMED_OK"
+    );
+
+
+    currentState = STATE_NORMAL;
+
+    currentAlertReason = "";
+
+    lastMovementTime = millis();
+
+    noTone(BUZZER_PIN);
+  }
+
+
+  // ----------------------------------------------------------
+  // Prevent repeated button triggers
+  // ----------------------------------------------------------
+
+  while (digitalRead(BUTTON_PIN) == LOW)
+  {
+    delay(10);
   }
 }
 
-// ==========================================
-// 8. HELPER FUNCTIONS
-// ==========================================
-void triggerAlert(WorkerState newState, String reason) {
-  currentState = newState;
-  alertStartTime = millis();
-  
-  // Start buzzing to get worker's attention
-  beepBuzzer(3, 500); // 3 long beeps
-  
-  // Log locally
-  Serial.println("ALERT: " + reason);
-}
 
-void beepBuzzer(int times, int duration) {
-  for (int i = 0; i < times; i++) {
-    tone(BUZZER_PIN, 1000); // 1kHz tone
+// ============================================================
+// 16. BUZZER
+// ============================================================
+
+void beepBuzzer(int times, int duration)
+{
+  for (int i = 0; i < times; i++)
+  {
+    tone(BUZZER_PIN, 1000);
+
     delay(duration);
+
     noTone(BUZZER_PIN);
+
     delay(100);
   }
 }
 
-void sendLoRaPacket(String message) {
-  String payload = WORKER_ID + "|" + message;
-  
+
+// ============================================================
+// 17. LORA TRANSMISSION
+// ============================================================
+
+void sendLoRaPacket(String message)
+{
+  String payload =
+    WORKER_ID +
+    "|" +
+    WORKER_ZONE +
+    "|" +
+    message;
+
+
   LoRa.beginPacket();
+
   LoRa.print(payload);
+
   LoRa.endPacket();
-  
-  Serial.println("LoRa Sent: " + payload);
+
+
+  Serial.println(
+    "LORA|" + payload
+  );
 }
+```
